@@ -19,11 +19,12 @@ __all__ = ["NoopRateLimiter", "RedisRateLimiter", "build_rate_limiter"]
 
 def build_rate_limiter(settings: Settings) -> RateLimiter:
     if not settings.rate_limit_enabled or not settings.redis_url:
+        # Never log the URL itself: it may carry the Redis password.
         logger.info(
-            "Rate limiting disabled (rate_limit_enabled=%s, redis_url=%r) "
+            "Rate limiting disabled (rate_limit_enabled=%s, redis_url set=%s) "
             "- all requests are allowed",
             settings.rate_limit_enabled,
-            settings.redis_url,
+            bool(settings.redis_url),
         )
         return NoopRateLimiter()
     return RedisRateLimiter(settings.redis_url)

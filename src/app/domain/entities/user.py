@@ -10,7 +10,9 @@ from app.domain.exceptions import DomainError
 
 MAX_EMAIL_LENGTH = 255
 MIN_PASSWORD_LENGTH = 8
-MAX_PASSWORD_LENGTH = 128
+# bcrypt only reads the first 72 bytes (bcrypt>=5 raises beyond that), and
+# non-ASCII characters take 2-4 bytes each - so the limit is in bytes.
+MAX_PASSWORD_BYTES = 72
 MAX_FULL_NAME_LENGTH = 255
 
 
@@ -27,8 +29,8 @@ def normalize_email(email: str) -> str:
 def validate_password(password: str) -> str:
     if len(password) < MIN_PASSWORD_LENGTH:
         raise DomainError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters long")
-    if len(password) > MAX_PASSWORD_LENGTH:
-        raise DomainError(f"Password must be at most {MAX_PASSWORD_LENGTH} characters")
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        raise DomainError(f"Password must be at most {MAX_PASSWORD_BYTES} bytes (UTF-8)")
     return password
 
 

@@ -8,7 +8,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    # Characters here; the domain also caps it at 72 UTF-8 bytes (bcrypt limit).
+    password: str = Field(min_length=8, max_length=72)
     full_name: str | None = Field(default=None, max_length=255)
 
 

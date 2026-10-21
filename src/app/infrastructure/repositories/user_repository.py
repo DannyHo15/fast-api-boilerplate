@@ -3,9 +3,11 @@
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.entities.user import User
+from app.domain.exceptions import ConflictError
 from app.infrastructure.database.mappers import user_to_domain
 from app.infrastructure.database.models.user import UserModel
 
@@ -23,7 +25,11 @@ class SqlAlchemyUserRepository:
             created_at=user.created_at,
         )
         self._session.add(model)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            # Unique email index: a concurrent registration won the race.
+            raise ConflictError(f"Email {user.email} is already registered") from exc
         return user_to_domain(model)
 
     async def get(self, user_id: UUID) -> User | None:

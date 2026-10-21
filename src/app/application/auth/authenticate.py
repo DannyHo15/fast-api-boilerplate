@@ -21,8 +21,11 @@ class AuthenticateUserUseCase:
 
     async def execute(self, input: AuthenticateUserInput) -> User:
         user = await self._users.get_by_email(normalize_email(input.email))
-        # Deliberately the same error for unknown email and wrong password:
-        # do not leak which emails exist.
-        if user is None or not self._passwords.verify(input.password, user.password_hash):
+        # Deliberately the same error AND the same cost for unknown email and
+        # wrong password: do not leak which emails exist.
+        if user is None:
+            self._passwords.hash("timing-equalizer")  # one bcrypt round, like verify
+            raise InvalidCredentialsError("Incorrect email or password")
+        if not self._passwords.verify(input.password, user.password_hash):
             raise InvalidCredentialsError("Incorrect email or password")
         return user

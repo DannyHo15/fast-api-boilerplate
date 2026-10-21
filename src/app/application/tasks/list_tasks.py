@@ -9,7 +9,6 @@ from app.domain.exceptions import DomainError
 from app.domain.ports.task_repository import TaskRepository
 
 MIN_PAGE_SIZE = 1
-MAX_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +26,9 @@ class ListTasksUseCase:
     async def execute(self, input: ListTasksInput) -> Page[Task]:
         if input.offset < 0:
             raise DomainError("offset must be >= 0")
-        if not MIN_PAGE_SIZE <= input.limit <= MAX_PAGE_SIZE:
-            raise DomainError(f"limit must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}")
+        # The upper bound is MAX_PAGE_SIZE in settings, enforced by the API layer.
+        if input.limit < MIN_PAGE_SIZE:
+            raise DomainError(f"limit must be >= {MIN_PAGE_SIZE}")
 
         items, total = await self._tasks.list_for_owner(
             input.owner_id,

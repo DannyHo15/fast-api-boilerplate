@@ -1,8 +1,9 @@
 """SQLAlchemy implementation of `app.domain.ports.task_repository.TaskRepository`."""
 
+from typing import cast
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import CursorResult, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.entities.task import Task, TaskStatus
@@ -69,9 +70,7 @@ class SqlAlchemyTaskRepository:
         return task_to_domain(model)
 
     async def delete(self, task_id: UUID, owner_id: UUID) -> bool:
-        task = await self.get_owned(task_id, owner_id)
-        if task is None:
-            return False
-        await self._session.execute(delete(TaskModel).where(TaskModel.id == task_id))
-        await self._session.flush()
-        return True
+        result = await self._session.execute(
+            delete(TaskModel).where(TaskModel.id == task_id, TaskModel.owner_id == owner_id)
+        )
+        return cast(CursorResult[object], result).rowcount > 0

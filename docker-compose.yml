@@ -41,12 +41,16 @@ services:
       LOG_LEVEL: "INFO"
       DATABASE_URL: "postgresql+asyncpg://postgres:postgres@db:5432/app"
       AUTO_CREATE_TABLES: "false"
-      SECRET_KEY: "change-me-in-production"
+      # Required: put SECRET_KEY=<openssl rand -hex 32> in .env (compose reads it).
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env, e.g. openssl rand -hex 32}"
       CORS_ORIGINS: '["*"]'
       REDIS_URL: "redis://redis:6379/0"
       RATE_LIMIT_ENABLED: "true"
       RATE_LIMIT_GLOBAL: "100"
       RATE_LIMIT_WINDOW_SECONDS: "60"
+      # Behind a reverse proxy / load balancer, trust its IP so rate limiting
+      # sees the real client IP. Never "*" while port 8000 is publicly reachable.
+      # FORWARDED_ALLOW_IPS: "10.0.0.0/8"
     ports:
       - "8000:8000"
     command:

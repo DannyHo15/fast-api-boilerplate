@@ -122,3 +122,33 @@ async def test_create_task_validation_error_shape(client) -> None:
     error = response.json()["error"]
     assert error["code"] == "VALIDATION_ERROR"
     assert error["details"]
+
+
+async def test_page_size_follows_the_app_settings(settings, tmp_path) -> None:
+    """MAX_PAGE_SIZE / DEFAULT_PAGE_SIZE come from the app's settings at request time."""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.infrastructure.database import Base, create_database
+    from app.main import create_app
+
+    custom = settings.model_copy(update={"max_page_size": 200, "default_page_size": 7})
+    app = create_app(custom)
+    app.state.database = create_database(custom.database_url)
+    async with app.state.database.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            headers = auth_headers(await _token(client))
+            ok = await client.get("/v1/tasks", params={"limit": 150}, headers=headers)
+            assert ok.status_code == 200, ok.text
+            assert ok.json()["meta"]["limit"] == 150
+
+            default = await client.get("/v1/tasks", headers=headers)
+            assert default.json()["meta"]["limit"] == 7
+
+            too_big = await client.get("/v1/tasks", params={"limit": 201}, headers=headers)
+            assert too_big.status_code == 422
+            assert too_big.json()["error"]["code"] == "VALIDATION_ERROR"
+    finally:
+        await app.state.database.dispose()

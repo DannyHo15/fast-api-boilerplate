@@ -9,6 +9,7 @@ API down) and logs the error.
 import logging
 
 import redis.asyncio as aioredis
+from redis.commands.core import AsyncScript
 
 from app.domain.ports.rate_limiter import RateLimitDecision
 
@@ -35,16 +36,19 @@ class RedisRateLimiter:
         self._redis_url = redis_url
         self._external_client = client
         self._client: aioredis.Redis | None = client
+        self._script: AsyncScript | None = None
 
-    async def _get_client(self) -> aioredis.Redis:
-        if self._client is None:
-            self._client = aioredis.from_url(self._redis_url, decode_responses=True)
-        return self._client
+    async def _get_script(self) -> AsyncScript:
+        # Connect and register the Lua script once, on first use.
+        if self._script is None:
+            if self._client is None:
+                self._client = aioredis.from_url(self._redis_url, decode_responses=True)
+            self._script = self._client.register_script(_WINDOW_SCRIPT)
+        return self._script
 
     async def hit(self, key: str, limit: int, window_seconds: int) -> RateLimitDecision:
         try:
-            client = await self._get_client()
-            script = client.register_script(_WINDOW_SCRIPT)
+            script = await self._get_script()
             current, ttl = await script(keys=[key], args=[limit, window_seconds])
         except Exception:
             logger.exception("Rate limiter backend unavailable (key=%s) - failing open", key)
@@ -59,4 +63,5 @@ class RedisRateLimiter:
     async def close(self) -> None:
         if self._client is not None and self._external_client is None:
             await self._client.aclose()
-        self._client = None
+            self._client = None
+        self._script = None

@@ -63,7 +63,7 @@ async def test_fail_open_when_backend_unavailable() -> None:
         raise ConnectionError("redis down")
 
     # Break the script call path entirely.
-    limiter._get_client = boom  # type: ignore[method-assign]
+    limiter._get_script = boom  # type: ignore[method-assign]
     decision: RateLimitDecision = await limiter.hit("k", limit=1, window_seconds=60)
     assert decision.allowed is True  # fail open
 
