@@ -6,14 +6,17 @@ domain ports are wired to their infrastructure implementations.
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Request
+from fastapi import Depends, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.api.v1 import API_V1_PREFIX
+from app.core.config import Settings
 from app.core.exceptions import InvalidTokenError
 from app.domain.entities.user import User
 from app.domain.exceptions import InvalidCredentialsError, RateLimitedError
@@ -24,19 +27,27 @@ from app.infrastructure.database.session import Database
 from app.infrastructure.repositories.task_repository import SqlAlchemyTaskRepository
 from app.infrastructure.repositories.user_repository import SqlAlchemyUserRepository
 
-_settings = get_settings()
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{_settings.api_v1_prefix}/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{API_V1_PREFIX}/auth/login")
 
 
 def get_database(request: Request) -> Database:
     return request.app.state.database  # type: ignore[no-any-return]
 
 
+def get_settings_dep(request: Request) -> Settings:
+    """The `Settings` the app was created with (not the global env settings)."""
+    return request.app.state.settings  # type: ignore[no-any-return]
+
+
+SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
+
+
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     """One session per request = one transaction (unit of work).
 
     Commits on success, rolls back on any exception, then closes.
+    `scope="function"` (below) makes this run before the response is sent,
+    so a failed commit becomes a 500 instead of a silently lost write.
     """
     database: Database = request.app.state.database
     async with database.session() as session:
@@ -48,7 +59,7 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
             raise
 
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 
 def get_user_repository(session: SessionDep) -> SqlAlchemyUserRepository:
@@ -86,27 +97,74 @@ def get_rate_limiter(request: Request) -> RateLimiter:
 RateLimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
 
 
-def rate_limit(scope: str, *, limit: int, window_seconds: int) -> Callable[..., Awaitable[None]]:
+def rate_limit(
+    scope: str,
+    *,
+    limit: int | Callable[[Settings], int],
+    window_seconds: int | Callable[[Settings], int],
+) -> Callable[..., Awaitable[None]]:
     """Build a FastAPI dependency enforcing `limit` hits per `window_seconds`.
 
     The counter is keyed per client IP within `scope` (namespaced keys, so
     e.g. the strict "auth" budget does not consume the "global" budget).
+    `limit` / `window_seconds` can be callables reading the app's settings
+    at request time.
 
     Usage:
-        @router.post("/login",
-                     dependencies=[Depends(rate_limit("auth", limit=10, window_seconds=60))])
+        @router.post("/export",
+                     dependencies=[Depends(rate_limit("export", limit=5, window_seconds=3600))])
+        rate_limit("global", limit=lambda s: s.rate_limit_global, window_seconds=60)
     """
 
     async def _enforce(
         request: Request,
         limiter: RateLimiterDep,
+        settings: SettingsDep,
     ) -> None:
+        # Behind a proxy this is the real client IP only if uvicorn trusts the
+        # proxy (FORWARDED_ALLOW_IPS) - otherwise every client shares one bucket.
         client_ip = request.client.host if request.client else "unknown"
-        decision = await limiter.hit(f"rl:{scope}:{client_ip}", limit, window_seconds)
+        max_hits = limit(settings) if callable(limit) else limit
+        window = window_seconds(settings) if callable(window_seconds) else window_seconds
+        decision = await limiter.hit(f"rl:{scope}:{client_ip}", max_hits, window)
         if not decision.allowed:
             raise RateLimitedError(retry_after=decision.retry_after)
 
     return _enforce
+
+
+@dataclass(frozen=True, slots=True)
+class PageParams:
+    offset: int
+    limit: int
+
+
+def get_page_params(
+    settings: SettingsDep,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[
+        int | None, Query(ge=1, description="Page size (default/max: DEFAULT/MAX_PAGE_SIZE)")
+    ] = None,
+) -> PageParams:
+    """`offset` / `limit` query params, bounded by the app's page-size settings."""
+    if limit is None:
+        return PageParams(offset=offset, limit=settings.default_page_size)
+    if limit > settings.max_page_size:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "less_than_equal",
+                    "loc": ("query", "limit"),
+                    "msg": f"Input should be less than or equal to {settings.max_page_size}",
+                    "input": limit,
+                    "ctx": {"le": settings.max_page_size},
+                }
+            ]
+        )
+    return PageParams(offset=offset, limit=limit)
+
+
+PageParamsDep = Annotated[PageParams, Depends(get_page_params)]
 
 
 async def get_current_user(

@@ -28,8 +28,11 @@ What it generates (for `notes`, entity `Note`):
       tests/integration/test_notes.py                  full HTTP flow
 
 The generated resource has two generic fields: `title` (required, string)
-and `body` (optional, text). Endpoints require auth (CurrentUser) but are
-NOT user-scoped - to scope per user, follow `tasks.py` as the reference.
+and `body` (optional, text). Like `tasks`, every record belongs to the user
+who created it (`owner_id`): other users get 404 and never see it in lists.
+
+All new and patched file contents are computed before anything is written,
+so a failing check leaves the repository untouched.
 
 After generating, run:
     make revision m="create notes table"   # autogenerate the migration
@@ -39,6 +42,8 @@ After generating, run:
 
 from __future__ import annotations
 
+import ast
+import keyword
 import re
 import string
 import subprocess
@@ -65,11 +70,16 @@ def pluralize(snake: str) -> str:
 
 
 def validate_name(name: str) -> None:
-    if not re.fullmatch(r"[a-z][a-z0-9]*(_[a-z0-9]+)*", name or ""):
+    if not re.fullmatch(r"[a-z][a-z0-9]*(_[a-z0-9]+)*", name or "") or keyword.iskeyword(name):
         sys.exit(
             f"error: invalid resource name {name!r} - use lowercase snake_case "
             "(e.g. 'note', 'user_profile')"
         )
+    # The endpoint module is imported into router.py by this name: it must not
+    # shadow anything already there (e.g. `rate_limited`, `api_router`).
+    router_text = (ROOT / "src/app/api/v1/router.py").read_text(encoding="utf-8")
+    if re.search(rf"\b{name}\b", router_text):
+        sys.exit(f"error: {name!r} is already used in src/app/api/v1/router.py - pick another name")
 
 
 # ---------------------------------------------------------------------------
@@ -77,65 +87,28 @@ def validate_name(name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def add_import(path: Path, new_import: str) -> None:
-    """Insert `new_import` into the contiguous `app.*` import block, sorted."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+def add_import(text: str, new_import: str) -> str:
+    """Insert `new_import` after the last top-level import (ruff sorts it later).
 
-    def is_app_import(line: str) -> bool:
-        s = line.strip()
-        return s.startswith("from app.") or s.startswith("import app.")
-
-    idxs = [i for i, line in enumerate(lines) if is_app_import(line)]
-    if not idxs:
-        sys.exit(f"error: no `app.*` import block found in {path}")
-    start, end = idxs[0], idxs[-1]
-    if end - start + 1 != len(idxs):
-        sys.exit(f"error: `app.*` import block in {path} is not contiguous")
-
-    imports = lines[start : end + 1]
-    if new_import in imports:
-        return  # idempotent
-    imports.append(new_import)
-
-    def sort_key(line: str) -> tuple[str, str]:
-        s = line.strip()
-        if s.startswith("import "):
-            return (s.split()[1], "")
-        head, tail = s.split("import", 1)
-        module = head.split()[-1]
-        first_name = tail.strip().split(",")[0].strip()
-        return (module, first_name)
-
-    imports.sort(key=sort_key)
-    lines[start : end + 1] = imports
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    Uses the AST, so imports wrapped over several lines by ruff are handled.
+    """
+    if new_import in text.splitlines():
+        return text  # idempotent
+    imports = [n for n in ast.parse(text).body if isinstance(n, ast.Import | ast.ImportFrom)]
+    if not imports:
+        sys.exit("error: no top-level import found to anchor the new import")
+    lines = text.splitlines(keepends=True)
+    lines.insert(imports[-1].end_lineno or len(lines), new_import + "\n")
+    return "".join(lines)
 
 
-def add_line_to_single_import(path: Path, module: str, name: str) -> None:
-    """Add `name` to `from <module> import a, b, c` (sorted, idempotent)."""
-    text = path.read_text(encoding="utf-8")
-    match = re.search(rf"^from {re.escape(module)} import (.+)$", text, flags=re.M)
-    if match is None:
-        sys.exit(f"error: import from {module} not found in {path}")
-    names = [n.strip() for n in match.group(1).split(",")]
-    if name in names:
-        return
-    names.append(name)
-    names.sort()
-    text = text.replace(
-        match.group(0), f"from {module} import " + ", ".join(names), 1
-    )
-    path.write_text(text, encoding="utf-8")
-
-
-def append_block(path: Path, marker: str, block: str) -> None:
+def append_block(text: str, marker: str, block: str) -> str:
     """Append `block` at EOF, guarded by `marker` (idempotent)."""
-    text = path.read_text(encoding="utf-8")
     if marker in text:
-        return
+        return text
     if not text.endswith("\n"):
         text += "\n"
-    path.write_text(text + "\n" + block, encoding="utf-8")
+    return text + "\n" + block
 
 
 # ---------------------------------------------------------------------------
@@ -178,15 +151,21 @@ def validate_body(body: str | None) -> str | None:
 @dataclass
 class ${pascal}:
     id: UUID
+    owner_id: UUID
     title: str
     body: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @classmethod
-    def create(cls, *, title: str, body: str | None = None) -> ${pascal}:
+    def create(cls, *, owner_id: UUID, title: str, body: str | None = None) -> ${pascal}:
         """Create a new ${snake}, enforcing business rules."""
-        return cls(id=uuid4(), title=validate_title(title), body=validate_body(body))
+        return cls(
+            id=uuid4(),
+            owner_id=owner_id,
+            title=validate_title(title),
+            body=validate_body(body),
+        )
 
     def touch(self) -> None:
         """Mark the ${snake} as modified (bump `updated_at`)."""
@@ -207,21 +186,22 @@ class ${pascal}Repository(Protocol):
         """Persist a new ${snake} and return the stored entity."""
         ...
 
-    async def get(self, ${snake}_id: UUID) -> ${pascal} | None:
+    async def get_owned(self, ${snake}_id: UUID, owner_id: UUID) -> ${pascal} | None:
+        """Return the ${snake} only if it exists AND belongs to `owner_id`."""
         ...
 
-    async def list_all(
-        self, *, offset: int = 0, limit: int = 20
+    async def list_for_owner(
+        self, owner_id: UUID, *, offset: int = 0, limit: int = 20
     ) -> tuple[list[${pascal}], int]:
-        """Return a page of ${plural} plus the total count."""
+        """Return a page of the owner's ${plural} plus the total count."""
         ...
 
     async def save(self, ${snake}: ${pascal}) -> ${pascal}:
         """Persist changes to an existing ${snake}."""
         ...
 
-    async def delete(self, ${snake}_id: UUID) -> bool:
-        """Delete the ${snake}. Returns success."""
+    async def delete(self, ${snake}_id: UUID, owner_id: UUID) -> bool:
+        """Delete the ${snake} if it belongs to `owner_id`. Returns success."""
         ...
 '''
 
@@ -231,6 +211,7 @@ CREATE_USECASE = '''\
 """Use case: create a ${snake}."""
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from app.domain.entities.${snake} import ${pascal}
 from app.domain.ports.${snake}_repository import ${pascal}Repository
@@ -238,6 +219,7 @@ from app.domain.ports.${snake}_repository import ${pascal}Repository
 
 @dataclass(frozen=True, slots=True)
 class Create${pascal}Input:
+    owner_id: UUID
     title: str
     body: str | None = None
 
@@ -247,7 +229,7 @@ class Create${pascal}UseCase:
         self._${plural} = ${plural}
 
     async def execute(self, input: Create${pascal}Input) -> ${pascal}:
-        ${snake} = ${pascal}.create(title=input.title, body=input.body)
+        ${snake} = ${pascal}.create(owner_id=input.owner_id, title=input.title, body=input.body)
         return await self._${plural}.add(${snake})
 '''
 
@@ -265,10 +247,10 @@ class Get${pascal}UseCase:
     def __init__(self, ${plural}: ${pascal}Repository) -> None:
         self._${plural} = ${plural}
 
-    async def execute(self, ${snake}_id: UUID) -> ${pascal}:
-        ${snake} = await self._${plural}.get(${snake}_id)
+    async def execute(self, *, ${snake}_id: UUID, owner_id: UUID) -> ${pascal}:
+        ${snake} = await self._${plural}.get_owned(${snake}_id, owner_id)
         if ${snake} is None:
-            raise NotFoundError(f"${pascal} {{{${snake}_id}}} not found")
+            raise NotFoundError(f"${pascal} {${snake}_id} not found")
         return ${snake}
 '''
 
@@ -276,6 +258,7 @@ LIST_USECASE = '''\
 """Use case: list ${plural} with pagination."""
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from app.application.common import Page
 from app.domain.entities.${snake} import ${pascal}
@@ -283,11 +266,11 @@ from app.domain.exceptions import DomainError
 from app.domain.ports.${snake}_repository import ${pascal}Repository
 
 MIN_PAGE_SIZE = 1
-MAX_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True, slots=True)
 class List${pascal_plural}Input:
+    owner_id: UUID
     offset: int = 0
     limit: int = 20
 
@@ -299,11 +282,12 @@ class List${pascal_plural}UseCase:
     async def execute(self, input: List${pascal_plural}Input) -> Page[${pascal}]:
         if input.offset < 0:
             raise DomainError("offset must be >= 0")
-        if not MIN_PAGE_SIZE <= input.limit <= MAX_PAGE_SIZE:
-            raise DomainError(f"limit must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}")
+        # The upper bound is MAX_PAGE_SIZE in settings, enforced by the API layer.
+        if input.limit < MIN_PAGE_SIZE:
+            raise DomainError(f"limit must be >= {MIN_PAGE_SIZE}")
 
-        items, total = await self._${plural}.list_all(
-            offset=input.offset, limit=input.limit
+        items, total = await self._${plural}.list_for_owner(
+            input.owner_id, offset=input.offset, limit=input.limit
         )
         return Page(items=items, total=total, offset=input.offset, limit=input.limit)
 '''
@@ -339,11 +323,11 @@ class Update${pascal}UseCase:
         self._${plural} = ${plural}
 
     async def execute(
-        self, *, ${snake}_id: UUID, changes: ${pascal}Changes
+        self, *, ${snake}_id: UUID, owner_id: UUID, changes: ${pascal}Changes
     ) -> ${pascal}:
-        ${snake} = await self._${plural}.get(${snake}_id)
+        ${snake} = await self._${plural}.get_owned(${snake}_id, owner_id)
         if ${snake} is None:
-            raise NotFoundError(f"${pascal} {{{${snake}_id}}} not found")
+            raise NotFoundError(f"${pascal} {${snake}_id} not found")
 
         if changes.has_changes():
             if is_set(changes.title):
@@ -367,10 +351,10 @@ class Delete${pascal}UseCase:
     def __init__(self, ${plural}: ${pascal}Repository) -> None:
         self._${plural} = ${plural}
 
-    async def execute(self, ${snake}_id: UUID) -> None:
-        deleted = await self._${plural}.delete(${snake}_id)
+    async def execute(self, *, ${snake}_id: UUID, owner_id: UUID) -> None:
+        deleted = await self._${plural}.delete(${snake}_id, owner_id)
         if not deleted:
-            raise NotFoundError(f"${pascal} {{{${snake}_id}}} not found")
+            raise NotFoundError(f"${pascal} {${snake}_id} not found")
 '''
 
 ORM_MODEL = '''\
@@ -379,7 +363,7 @@ ORM_MODEL = '''\
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, String, Text, Uuid
+from sqlalchemy import DateTime, ForeignKey, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.database.base import Base
@@ -389,6 +373,9 @@ class ${pascal}Model(Base):
     __tablename__ = "${plural}"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     title: Mapped[str] = mapped_column(String(255))
     body: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
@@ -401,15 +388,16 @@ class ${pascal}Model(Base):
     )
 
     def __repr__(self) -> str:  # pragma: no cover
-        return f"<${pascal}Model id={{{self.id}}} title={{{self.title!r}}}>"
+        return f"<${pascal}Model id={self.id} title={self.title!r}>"
 '''
 
 REPOSITORY = '''\
-"""SQLAlchemy implementation of `app.domain.ports.${snake}_repository.${pascal}Repository`."""
+"""SQLAlchemy implementation of the `${pascal}Repository` port."""
 
+from typing import cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.entities.${snake} import ${pascal}
@@ -428,14 +416,17 @@ class SqlAlchemy${pascal}Repository:
         await self._session.flush()
         return ${snake}_to_domain(model)
 
-    async def get(self, ${snake}_id: UUID) -> ${pascal} | None:
-        model = await self._session.get(${pascal}Model, ${snake}_id)
+    async def get_owned(self, ${snake}_id: UUID, owner_id: UUID) -> ${pascal} | None:
+        stmt = select(${pascal}Model).where(
+            ${pascal}Model.id == ${snake}_id, ${pascal}Model.owner_id == owner_id
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
         return ${snake}_to_domain(model) if model is not None else None
 
-    async def list_all(
-        self, *, offset: int = 0, limit: int = 20
+    async def list_for_owner(
+        self, owner_id: UUID, *, offset: int = 0, limit: int = 20
     ) -> tuple[list[${pascal}], int]:
-        base = select(${pascal}Model)
+        base = select(${pascal}Model).where(${pascal}Model.owner_id == owner_id)
         total = (
             await self._session.execute(
                 select(func.count()).select_from(base.subquery())
@@ -452,26 +443,27 @@ class SqlAlchemy${pascal}Repository:
     async def save(self, ${snake}: ${pascal}) -> ${pascal}:
         model = await self._session.get(${pascal}Model, ${snake}.id)
         if model is None:
-            raise NotFoundError(f"${pascal} {{{${snake}.id}}} not found")
+            raise NotFoundError(f"${pascal} {${snake}.id} not found")
         model.title = ${snake}.title
         model.body = ${snake}.body
         model.updated_at = ${snake}.updated_at
         await self._session.flush()
         return ${snake}_to_domain(model)
 
-    async def delete(self, ${snake}_id: UUID) -> bool:
-        model = await self._session.get(${pascal}Model, ${snake}_id)
-        if model is None:
-            return False
-        await self._session.delete(model)
-        await self._session.flush()
-        return True
+    async def delete(self, ${snake}_id: UUID, owner_id: UUID) -> bool:
+        result = await self._session.execute(
+            delete(${pascal}Model).where(
+                ${pascal}Model.id == ${snake}_id, ${pascal}Model.owner_id == owner_id
+            )
+        )
+        return cast(CursorResult[object], result).rowcount > 0
 '''
 
-MAPPER_BLOCK = '''\
+MAPPER_BLOCK = """\
 def ${snake}_to_domain(model: ${pascal}Model) -> ${pascal}:
     return ${pascal}(
         id=model.id,
+        owner_id=model.owner_id,
         title=model.title,
         body=model.body,
         created_at=model.created_at,
@@ -482,12 +474,13 @@ def ${snake}_to_domain(model: ${pascal}Model) -> ${pascal}:
 def ${snake}_to_model(${snake}: ${pascal}) -> ${pascal}Model:
     return ${pascal}Model(
         id=${snake}.id,
+        owner_id=${snake}.owner_id,
         title=${snake}.title,
         body=${snake}.body,
         created_at=${snake}.created_at,
         updated_at=${snake}.updated_at,
     )
-'''
+"""
 
 SCHEMA = '''\
 """${pascal} schemas."""
@@ -526,14 +519,16 @@ class ${pascal}Read(BaseModel):
 '''
 
 ENDPOINT = '''\
-"""${pascal} endpoints (full CRUD). Generated - adjust as needed."""
+"""${pascal} endpoints (CRUD, scoped to the authenticated user).
 
-from typing import Annotated
+Generated by scripts/generate_crud.py - adjust as needed.
+"""
+
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter
 
-from app.api.deps import CurrentUser, ${pascal}RepositoryDep
+from app.api.deps import CurrentUser, PageParamsDep, ${pascal}RepositoryDep
 from app.api.schemas.common import Page, PageMeta
 from app.api.schemas.${snake} import ${pascal}Create, ${pascal}Read, ${pascal}Update
 from app.application.${snake}.create_${snake} import Create${pascal}Input, Create${pascal}UseCase
@@ -544,12 +539,9 @@ from app.application.${snake}.list_${snake} import (
     List${pascal_plural}UseCase,
 )
 from app.application.${snake}.update_${snake} import ${pascal}Changes, Update${pascal}UseCase
-from app.core.config import get_settings
 from app.domain.entities.${snake} import ${pascal}
 
 router = APIRouter()
-
-_settings = get_settings()
 
 
 def _build_changes(payload: ${pascal}Update) -> ${pascal}Changes:
@@ -575,25 +567,22 @@ async def create_${snake}(
 ) -> ${pascal}:
     usecase = Create${pascal}UseCase(${plural})
     return await usecase.execute(
-        Create${pascal}Input(title=payload.title, body=payload.body)
+        Create${pascal}Input(owner_id=user.id, title=payload.title, body=payload.body)
     )
 
 
 @router.get(
     "",
     response_model=Page[${pascal}Read],
-    summary="List ${plural}",
+    summary="List the authenticated user's ${plural}",
 )
 async def list_${plural}(
     ${plural}: ${pascal}RepositoryDep,
     user: CurrentUser,
-    offset: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=_settings.max_page_size)] = (
-        _settings.default_page_size
-    ),
+    paging: PageParamsDep,
 ) -> Page[${pascal}Read]:
     page = await List${pascal_plural}UseCase(${plural}).execute(
-        List${pascal_plural}Input(offset=offset, limit=limit)
+        List${pascal_plural}Input(owner_id=user.id, offset=paging.offset, limit=paging.limit)
     )
     return Page[${pascal}Read](
         items=[${pascal}Read.model_validate(item) for item in page.items],
@@ -617,7 +606,7 @@ async def get_${snake}(
     user: CurrentUser,
 ) -> ${pascal}:
     usecase = Get${pascal}UseCase(${plural})
-    return await usecase.execute(${snake}_id)
+    return await usecase.execute(${snake}_id=${snake}_id, owner_id=user.id)
 
 
 @router.patch(
@@ -633,7 +622,7 @@ async def update_${snake}(
 ) -> ${pascal}:
     usecase = Update${pascal}UseCase(${plural})
     return await usecase.execute(
-        ${snake}_id=${snake}_id, changes=_build_changes(payload)
+        ${snake}_id=${snake}_id, owner_id=user.id, changes=_build_changes(payload)
     )
 
 
@@ -648,10 +637,10 @@ async def delete_${snake}(
     user: CurrentUser,
 ) -> None:
     usecase = Delete${pascal}UseCase(${plural})
-    await usecase.execute(${snake}_id)
+    await usecase.execute(${snake}_id=${snake}_id, owner_id=user.id)
 '''
 
-DEPS_BLOCK = '''\
+DEPS_BLOCK = """\
 def get_${snake}_repository(session: SessionDep) -> SqlAlchemy${pascal}Repository:
     return SqlAlchemy${pascal}Repository(session)
 
@@ -659,7 +648,7 @@ def get_${snake}_repository(session: SessionDep) -> SqlAlchemy${pascal}Repositor
 ${pascal}RepositoryDep = Annotated[
     SqlAlchemy${pascal}Repository, Depends(get_${snake}_repository)
 ]
-'''
+"""
 
 UNIT_TEST = '''\
 """Unit tests for ${pascal} use cases (against an in-memory repository fake).
@@ -685,6 +674,9 @@ from app.application.${snake}.update_${snake} import ${pascal}Changes, Update${p
 from app.domain.entities.${snake} import ${pascal}
 from app.domain.exceptions import DomainError, NotFoundError
 
+OWNER = uuid.uuid4()
+OTHER = uuid.uuid4()
+
 
 class InMemory${pascal}Repository:
     def __init__(self) -> None:
@@ -694,14 +686,17 @@ class InMemory${pascal}Repository:
         self._items[${snake}.id] = ${snake}
         return ${snake}
 
-    async def get(self, ${snake}_id: uuid.UUID) -> ${pascal} | None:
-        return self._items.get(${snake}_id)
+    async def get_owned(self, ${snake}_id: uuid.UUID, owner_id: uuid.UUID) -> ${pascal} | None:
+        item = self._items.get(${snake}_id)
+        return item if item is not None and item.owner_id == owner_id else None
 
-    async def list_all(
-        self, *, offset: int = 0, limit: int = 20
+    async def list_for_owner(
+        self, owner_id: uuid.UUID, *, offset: int = 0, limit: int = 20
     ) -> tuple[list[${pascal}], int]:
         items = sorted(
-            self._items.values(), key=lambda t: (t.created_at, t.id), reverse=True
+            (t for t in self._items.values() if t.owner_id == owner_id),
+            key=lambda t: (t.created_at, t.id),
+            reverse=True,
         )
         return items[offset : offset + limit], len(items)
 
@@ -709,82 +704,95 @@ class InMemory${pascal}Repository:
         self._items[${snake}.id] = ${snake}
         return ${snake}
 
-    async def delete(self, ${snake}_id: uuid.UUID) -> bool:
-        return self._items.pop(${snake}_id, None) is not None
+    async def delete(self, ${snake}_id: uuid.UUID, owner_id: uuid.UUID) -> bool:
+        if await self.get_owned(${snake}_id, owner_id) is None:
+            return False
+        del self._items[${snake}_id]
+        return True
+
+
+async def _create(
+    repo: InMemory${pascal}Repository, title: str = "t", body: str | None = None
+) -> ${pascal}:
+    return await Create${pascal}UseCase(repo).execute(
+        Create${pascal}Input(owner_id=OWNER, title=title, body=body)
+    )
 
 
 async def test_create_${snake}_persists_and_trims() -> None:
     repo = InMemory${pascal}Repository()
-    ${snake} = await Create${pascal}UseCase(repo).execute(
-        Create${pascal}Input(title="  Hello  ", body="  World  ")
-    )
+    ${snake} = await _create(repo, "  Hello  ", body="  World  ")
     assert ${snake}.title == "Hello"
     assert ${snake}.body == "World"
-    assert await repo.get(${snake}.id) is not None
+    assert ${snake}.owner_id == OWNER
+    assert await repo.get_owned(${snake}.id, OWNER) is not None
 
 
 async def test_create_${snake}_rejects_blank_title() -> None:
-    usecase = Create${pascal}UseCase(InMemory${pascal}Repository())
     with pytest.raises(DomainError):
-        await usecase.execute(Create${pascal}Input(title="   "))
+        await _create(InMemory${pascal}Repository(), "   ")
 
 
 async def test_get_${snake}_found() -> None:
     repo = InMemory${pascal}Repository()
-    created = await Create${pascal}UseCase(repo).execute(
-        Create${pascal}Input(title="t")
-    )
-    result = await Get${pascal}UseCase(repo).execute(created.id)
+    created = await _create(repo)
+    result = await Get${pascal}UseCase(repo).execute(${snake}_id=created.id, owner_id=OWNER)
     assert result.id == created.id
 
 
-async def test_get_${snake}_missing_raises_not_found() -> None:
-    usecase = Get${pascal}UseCase(InMemory${pascal}Repository())
+async def test_get_${snake}_of_another_owner_raises_not_found() -> None:
+    repo = InMemory${pascal}Repository()
+    created = await _create(repo)
     with pytest.raises(NotFoundError):
-        await usecase.execute(uuid.uuid4())
+        await Get${pascal}UseCase(repo).execute(${snake}_id=created.id, owner_id=OTHER)
 
 
-async def test_list_${plural}_pagination() -> None:
+async def test_list_${plural}_pagination_is_per_owner() -> None:
     repo = InMemory${pascal}Repository()
     for i in range(5):
-        await Create${pascal}UseCase(repo).execute(
-            Create${pascal}Input(title=f"${snake} {{{i}}}")
-        )
+        await _create(repo, f"${snake} {i}")
     page = await List${pascal_plural}UseCase(repo).execute(
-        List${pascal_plural}Input(offset=0, limit=2)
+        List${pascal_plural}Input(owner_id=OWNER, offset=0, limit=2)
     )
     assert len(page.items) == 2
     assert page.total == 5
     assert page.has_more is True
 
+    other = await List${pascal_plural}UseCase(repo).execute(
+        List${pascal_plural}Input(owner_id=OTHER)
+    )
+    assert other.total == 0
+
 
 async def test_update_${snake}_partial_and_clear_body() -> None:
     repo = InMemory${pascal}Repository()
-    created = await Create${pascal}UseCase(repo).execute(
-        Create${pascal}Input(title="old", body="old body")
-    )
-    updated = await Update${pascal}UseCase(repo).execute(
-        ${snake}_id=created.id, changes=${pascal}Changes(title="new")
+    created = await _create(repo, "old", body="old body")
+    usecase = Update${pascal}UseCase(repo)
+    updated = await usecase.execute(
+        ${snake}_id=created.id, owner_id=OWNER, changes=${pascal}Changes(title="new")
     )
     assert updated.title == "new"
     assert updated.body == "old body"  # untouched
 
-    cleared = await Update${pascal}UseCase(repo).execute(
-        ${snake}_id=created.id, changes=${pascal}Changes(body=None)
+    cleared = await usecase.execute(
+        ${snake}_id=created.id, owner_id=OWNER, changes=${pascal}Changes(body=None)
     )
     assert cleared.body is None
 
 
 async def test_delete_${snake}() -> None:
     repo = InMemory${pascal}Repository()
-    created = await Create${pascal}UseCase(repo).execute(Create${pascal}Input(title="t"))
+    created = await _create(repo)
     usecase = Delete${pascal}UseCase(repo)
 
-    await usecase.execute(created.id)
-    assert await repo.get(created.id) is None
+    with pytest.raises(NotFoundError):
+        await usecase.execute(${snake}_id=created.id, owner_id=OTHER)
+
+    await usecase.execute(${snake}_id=created.id, owner_id=OWNER)
+    assert await repo.get_owned(created.id, OWNER) is None
 
     with pytest.raises(NotFoundError):
-        await usecase.execute(created.id)
+        await usecase.execute(${snake}_id=created.id, owner_id=OWNER)
 '''
 
 INTEGRATION_TEST = '''\
@@ -796,8 +804,8 @@ Generated by scripts/generate_crud.py - extend as the ${snake} rules grow.
 from tests.helpers import auth_headers, register_and_login
 
 
-async def _token(client) -> str:
-    body = await register_and_login(client)
+async def _token(client, email: str = "alice@example.com") -> str:
+    body = await register_and_login(client, email=email)
     return body["access_token"]
 
 
@@ -817,7 +825,7 @@ async def test_full_${snake}_crud_flow(client) -> None:
     item_id = item["id"]
 
     # Read
-    response = await client.get(f"/v1/${plural}/{{{item_id}}}", headers=headers)
+    response = await client.get(f"/v1/${plural}/{item_id}", headers=headers)
     assert response.status_code == 200
     assert response.json()["id"] == item_id
 
@@ -828,7 +836,7 @@ async def test_full_${snake}_crud_flow(client) -> None:
 
     # Update (partial + clear body)
     response = await client.patch(
-        f"/v1/${plural}/{{{item_id}}}",
+        f"/v1/${plural}/{item_id}",
         json={"title": "Updated", "body": None},
         headers=headers,
     )
@@ -837,29 +845,41 @@ async def test_full_${snake}_crud_flow(client) -> None:
     assert response.json()["body"] is None
 
     # Delete
+    assert (await client.delete(f"/v1/${plural}/{item_id}", headers=headers)).status_code == 204
+    response = await client.get(f"/v1/${plural}/{item_id}", headers=headers)
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+async def test_${plural}_are_scoped_to_their_owner(client) -> None:
+    alice = auth_headers(await _token(client, "alice@example.com"))
+    bob = auth_headers(await _token(client, "bob@example.com"))
+
+    item_id = (
+        await client.post("/v1/${plural}", json={"title": "alice only"}, headers=alice)
+    ).json()["id"]
+
+    # Bob cannot see, update, or delete Alice's ${snake}.
+    assert (await client.get(f"/v1/${plural}/{item_id}", headers=bob)).status_code == 404
     assert (
-        await client.delete(f"/v1/${plural}/{{{item_id}}}", headers=headers)
-    ).status_code == 204
-    assert (
-        await client.get(f"/v1/${plural}/{{{item_id}}}", headers=headers)
+        await client.patch(f"/v1/${plural}/{item_id}", json={"title": "x"}, headers=bob)
     ).status_code == 404
-    assert (
-        await client.get(f"/v1/${plural}/{{{item_id}}}", headers=headers)
-    ).json()["error"]["code"] == "NOT_FOUND"
+    assert (await client.delete(f"/v1/${plural}/{item_id}", headers=bob)).status_code == 404
+    assert (await client.get("/v1/${plural}", headers=bob)).json()["meta"]["total"] == 0
+
+    # Alice's ${snake} is intact.
+    response = await client.get(f"/v1/${plural}/{item_id}", headers=alice)
+    assert response.json()["title"] == "alice only"
 
 
 async def test_${plural}_require_authentication(client) -> None:
-    assert (
-        await client.post("/v1/${plural}", json={"title": "x"})
-    ).status_code == 401
+    assert (await client.post("/v1/${plural}", json={"title": "x"})).status_code == 401
     assert (await client.get("/v1/${plural}")).status_code == 401
 
 
 async def test_create_${snake}_validation_error_shape(client) -> None:
     headers = auth_headers(await _token(client))
-    response = await client.post(
-        "/v1/${plural}", json={"title": ""}, headers=headers
-    )
+    response = await client.post("/v1/${plural}", json={"title": ""}, headers=headers)
     assert response.status_code == 422
     error = response.json()["error"]
     assert error["code"] == "VALIDATION_ERROR"
@@ -876,12 +896,20 @@ def render(template: str, mapping: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def write_new_file(path: Path, content: str, created: list[Path]) -> None:
-    if path.exists():
-        sys.exit(f"error: refusing to overwrite existing file: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    created.append(path)
+def run_ruff(paths: list[Path]) -> None:
+    """Sort imports (merges the inserted ones) and format. Best effort."""
+    args = [str(p) for p in paths]
+    for cmd in (["check", "--select", "I", "--fix", "--quiet"], ["format", "--quiet"]):
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "ruff", *cmd, *args],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("warning: ruff unavailable or failed - run `make format` yourself")
+            return
 
 
 def generate(name: str) -> None:
@@ -897,17 +925,8 @@ def generate(name: str) -> None:
         "pascal_plural": pascal_plural,
     }
 
-    entity_path = ROOT / f"src/app/domain/entities/{snake}.py"
-    if entity_path.exists():
-        sys.exit(
-            f"error: resource {name!r} already exists ({entity_path}). "
-            "Delete its files first (see the generated list below)."
-        )
-
-    created: list[Path] = []
-
-    # --- new files ---------------------------------------------------------
-    files: dict[str, str] = {
+    # --- new files (checked before anything is written) ---------------------
+    templates: dict[str, str] = {
         f"src/app/domain/entities/{snake}.py": ENTITY,
         f"src/app/domain/ports/{snake}_repository.py": PORT,
         f"src/app/application/{snake}/__init__.py": APP_INIT,
@@ -923,79 +942,69 @@ def generate(name: str) -> None:
         f"tests/unit/application/test_{snake}_usecases.py": UNIT_TEST,
         f"tests/integration/test_{plural}.py": INTEGRATION_TEST,
     }
-    for rel, template in files.items():
-        write_new_file(ROOT / rel, render(template, m), created)
+    new_files = {ROOT / rel: render(t, m) for rel, t in templates.items()}
+    existing = [p for p in new_files if p.exists()]
+    if existing:
+        sys.exit(
+            f"error: resource {name!r} (or a file it needs) already exists:\n"
+            + "\n".join(f"  {p.relative_to(ROOT)}" for p in existing)
+        )
 
-    # --- patched files ------------------------------------------------------
-    # 1. models/__init__.py: register the new ORM model
-    add_import(
-        ROOT / "src/app/infrastructure/database/models/__init__.py",
-        f"from app.infrastructure.database.models.{snake} import "
-        f"{pascal}Model as {pascal}Model",
-    )
-
-    # 2. mappers.py: import + mapper functions
+    # --- patched files (computed in memory) --------------------------------
+    models_init = ROOT / "src/app/infrastructure/database/models/__init__.py"
     mappers = ROOT / "src/app/infrastructure/database/mappers.py"
-    add_import(mappers, f"from app.domain.entities.{snake} import {pascal}")
-    add_import(
-        mappers,
-        f"from app.infrastructure.database.models.{snake} import {pascal}Model",
-    )
-    append_block(
-        mappers,
-        f"def {snake}_to_domain(",
-        render(MAPPER_BLOCK, m),
-    )
-
-    # 3. deps.py: repository dependency
     deps = ROOT / "src/app/api/deps.py"
-    add_import(
-        deps,
-        f"from app.infrastructure.repositories.{snake}_repository import SqlAlchemy{pascal}Repository",
-    )
-    append_block(deps, f"def get_{snake}_repository(", render(DEPS_BLOCK, m))
-
-    # 4. v1 router: import + registration
     router = ROOT / "src/app/api/v1/router.py"
-    add_line_to_single_import(router, "app.api.v1.endpoints", snake)
-    append_block(
-        router,
-        f"{snake}.router",
-        f'api_router.include_router({snake}.router, prefix="/{plural}", tags=["{plural}"])',
+
+    text = models_init.read_text(encoding="utf-8")
+    patched = {
+        models_init: add_import(
+            text,
+            f"from app.infrastructure.database.models.{snake} import "
+            f"{pascal}Model as {pascal}Model",
+        )
+    }
+
+    text = mappers.read_text(encoding="utf-8")
+    text = add_import(text, f"from app.domain.entities.{snake} import {pascal}")
+    text = add_import(text, f"from app.infrastructure.database.models.{snake} import {pascal}Model")
+    patched[mappers] = append_block(text, f"def {snake}_to_domain(", render(MAPPER_BLOCK, m))
+
+    text = deps.read_text(encoding="utf-8")
+    text = add_import(
+        text,
+        f"from app.infrastructure.repositories.{snake}_repository import "
+        f"SqlAlchemy{pascal}Repository",
+    )
+    patched[deps] = append_block(text, f"def get_{snake}_repository(", render(DEPS_BLOCK, m))
+
+    text = router.read_text(encoding="utf-8")
+    text = add_import(text, f"from app.api.v1.endpoints import {snake}")
+    patched[router] = append_block(
+        text,
+        f"({snake}.router",
+        f"api_router.include_router(\n    {snake}.router,"
+        f' prefix="/{plural}", tags=["{plural}"], dependencies=rate_limited\n)\n',
     )
 
-    # --- format (best effort) ------------------------------------------------
-    for path in created:
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "ruff", "format", str(path)],
-                check=True,
-                capture_output=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-    for path in (mappers, deps, router):
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "ruff", "format", str(path)],
-                check=True,
-                capture_output=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
+    # --- write --------------------------------------------------------------
+    for path, content in {**new_files, **patched}.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    run_ruff([*new_files, *patched])
 
     # --- summary --------------------------------------------------------------
-    print(f"Generated {pascal} resource ({len(created)} new files):")
-    for path in created:
+    print(f"Generated {pascal} resource ({len(new_files)} new files):")
+    for path in new_files:
         print(f"  + {path.relative_to(ROOT)}")
     print("Patched:")
-    print(f"  ~ src/app/infrastructure/database/models/__init__.py (model registered)")
-    print(f"  ~ src/app/infrastructure/database/mappers.py (mappers)")
-    print(f"  ~ src/app/api/deps.py (repository dependency)")
-    print(f"  ~ src/app/api/v1/router.py (router registered)")
+    for path in patched:
+        print(f"  ~ {path.relative_to(ROOT)}")
     print()
-    print("Endpoints (auth required): POST/GET /v1/" + plural
-          + ", GET/PATCH/DELETE /v1/" + plural + "/{id}")
+    print(
+        f"Endpoints (auth required, scoped to the caller): POST/GET /v1/{plural}, "
+        f"GET/PATCH/DELETE /v1/{plural}/{{id}}"
+    )
     print()
     print("Next steps:")
     print(f'  1. make revision m="create {plural} table"   # autogenerate migration')

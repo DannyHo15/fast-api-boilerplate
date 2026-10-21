@@ -15,8 +15,10 @@ class FakeRateLimiter:
     def __init__(self, budget: int) -> None:
         self.budget = budget
         self._hits: dict[str, int] = {}
+        self.limits: dict[str, tuple[int, int]] = {}  # scope -> (limit, window)
 
     async def hit(self, key: str, limit: int, window_seconds: int) -> RateLimitDecision:
+        self.limits[key.split(":")[1]] = (limit, window_seconds)
         self._hits[key] = self._hits.get(key, 0) + 1
         if self._hits[key] > self.budget:
             return RateLimitDecision(allowed=False, retry_after=30)
@@ -50,10 +52,11 @@ async def test_global_limit_returns_429(app, settings) -> None:
 
     transport = _client_for(app)
     async with transport as ac:
+        # The limit runs before auth: anonymous requests get 401 until the budget is spent.
         for _ in range(3):
-            assert (await ac.get("/v1/health")).status_code == 200
+            assert (await ac.get("/v1/users/me")).status_code == 401
 
-        response = await ac.get("/v1/health")
+        response = await ac.get("/v1/users/me")
         assert response.status_code == 429
         assert response.headers["Retry-After"] == "30"
         body = response.json()
@@ -102,7 +105,7 @@ async def test_429_header_and_envelope_shape(app, settings) -> None:
 
     transport = _client_for(app)
     async with transport as ac:
-        response = await ac.get("/v1/health")
+        response = await ac.get("/v1/users/me")
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "30"
     body: dict[str, Any] = response.json()
@@ -115,3 +118,29 @@ def _client_for(app):
     from httpx import ASGITransport, AsyncClient
 
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")
+
+
+async def test_health_is_not_rate_limited(app) -> None:
+    """Load-balancer probes must never be answered with 429."""
+    limiter = FakeRateLimiter(budget=0)
+    app.state.rate_limiter = limiter
+    async with _client_for(app) as ac:
+        assert (await ac.get("/v1/health")).status_code == 200
+        assert (await ac.get("/health")).status_code == 200
+    assert limiter._hits == {}
+
+
+async def test_limits_come_from_the_app_settings(app) -> None:
+    """`create_app(settings)` is honored at request time, not the global env settings."""
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "rate_limit_global": 7,
+            "rate_limit_window_seconds": 30,
+            "rate_limit_auth_per_minute": 3,
+        }
+    )
+    limiter = FakeRateLimiter(budget=10)
+    app.state.rate_limiter = limiter
+    async with _client_for(app) as ac:
+        await ac.post("/v1/auth/login", json={"email": "a@example.com", "password": "x" * 8})
+    assert limiter.limits == {"global": (7, 30), "auth": (3, 60)}

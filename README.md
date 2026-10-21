@@ -79,8 +79,9 @@ src/app/
 # 1. Tạo venv + cài đặt
 make install            # hoặc: python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
-# 2. Tạo file env (mặc định dùng SQLite tại ./app.db, auto-create tables)
-cp .env.example .env
+# 2. Tạo file .env từ .env.example + tự sinh SECRET_KEY ngẫu nhiên
+#    (mặc định dùng SQLite tại ./app.db, auto-create tables)
+make env
 
 # 3. Chạy server (dev, có reload)
 make run                # hoặc: .venv/bin/uvicorn app.main:app --reload
@@ -138,8 +139,8 @@ Cơ chế **fixed-window counter** lưu trên Redis (1 Lua script atomic
 
 | Scope | Áp dụng | Limit mặc định |
 |-------|---------|----------------|
-| `global` | Mọi endpoint `/v1/*` (router-level dependency) | `RATE_LIMIT_GLOBAL` / `RATE_LIMIT_WINDOW_SECONDS` (100/60s) |
-| `auth` | `/v1/auth/register` + `/v1/auth/login` (chống brute-force) | 10/60s (`AUTH_LIMIT_PER_MINUTE` trong `auth.py`) |
+| `global` | Mọi endpoint `/v1/*` trừ `/v1/health` (probe của load balancer không bao giờ bị 429) | `RATE_LIMIT_GLOBAL` / `RATE_LIMIT_WINDOW_SECONDS` (100/60s) |
+| `auth` | `/v1/auth/register` + `/v1/auth/login` (chống brute-force) | `RATE_LIMIT_AUTH_PER_MINUTE` (10/60s) |
 
 Hai scope **độc lập** với nhau: hết budget `auth` không ảnh hưởng budget
 `global` và ngược lại. Khi bị limit, API trả về `429` cùng envelope chuẩn +
@@ -162,17 +163,20 @@ Thiết kế:
 - **Zero-setup**: `REDIS_URL` để trống → rate limiting tắt, chạy dev không cần
   Redis (docker-compose bật sẵn khi deploy).
 
-Tăng giảm limit: sửa `RATE_LIMIT_GLOBAL` / `RATE_LIMIT_WINDOW_SECONDS` trong
-`.env` (global), hoặc hằng số trong `api/v1/endpoints/auth.py` (auth), hoặc
-dùng `rate_limit(...)` dependency cho endpoint bất kỳ:
+Tăng giảm limit: sửa `RATE_LIMIT_GLOBAL` / `RATE_LIMIT_WINDOW_SECONDS` /
+`RATE_LIMIT_AUTH_PER_MINUTE` trong `.env` (đọc lúc request từ settings của app,
+nên `create_app(Settings(...))` trong test cũng áp dụng), hoặc dùng
+`rate_limit(...)` dependency cho endpoint bất kỳ:
 
 ```python
 @router.post("/export", dependencies=[Depends(rate_limit("export", limit=5, window_seconds=3600))])
 ```
 
-> Lưu ý: IP client lấy từ `request.client.host`. Sau reverse proxy (nginx,
-> Cloudflare...), cần cấu hình proxy trust và cân nhắc dùng header
-> `X-Forwarded-For` (tự viết thêm middleware nếu cần) để limit theo IP thật.
+> **Sau reverse proxy / load balancer** (nginx, ALB, k8s ingress...): đặt env
+> `FORWARDED_ALLOW_IPS` = IP/CIDR của proxy (vd `10.0.0.0/8`). Uvicorn sẽ lấy
+> IP thật từ `X-Forwarded-For`; nếu không, mọi client dùng chung 1 bucket (IP
+> của proxy) và cả hệ thống bị 429 cùng lúc. Đừng dùng `*` khi port 8000 mở
+> thẳng ra internet — client sẽ giả được IP.
 
 ## Migrations (Alembic)
 
@@ -189,9 +193,14 @@ make revision m="add notes column"          # autogenerate migration mới sau k
 ## Docker (PostgreSQL)
 
 ```bash
-make docker-up        # build + chạy api (8000) + postgres (5432)
+make env              # nếu chưa có .env: sinh SECRET_KEY (compose đọc từ .env)
+make docker-up        # build + chạy migration + api (8000) + postgres (5432) + redis
 make docker-down
 ```
+
+Container chạy bằng user không phải root, tự `alembic upgrade head` trước khi
+start uvicorn. App **từ chối khởi động** nếu `SECRET_KEY` ngắn hơn 32 ký tự mà
+`DEBUG=false`.
 
 ## Tests & chất lượng code
 
@@ -230,8 +239,9 @@ Tương tự `nest generate resource` — script `scripts/generate_crud.py` sinh
 | Tests | `test_projects_usecases.py` (fake in-memory) + `test_projects.py` (integration HTTP) |
 
 Resource sinh ra có 2 field tổng quát `title` (required) + `body` (optional),
-bắt buộc auth (`CurrentUser`) nhưng **chưa** scoped theo user — muốn scoped
-như tasks thì xem `tasks.py` làm mẫu. Sau khi sinh:
+bắt buộc auth (`CurrentUser`) và **scoped theo user** giống tasks (`owner_id`:
+user khác nhận 404, không thấy trong list). Script tính toàn bộ nội dung trước
+khi ghi, nên nếu lỗi (vd tên trùng) thì repo không bị sửa dở dang. Sau khi sinh:
 
 ```bash
 make revision m="create projects table"   # autogenerate migration
@@ -262,19 +272,20 @@ không cần database, không cần FastAPI.
 | Biến                        | Mặc định                        | Ý nghĩa                                  |
 |-----------------------------|---------------------------------|------------------------------------------|
 | `APP_NAME`                  | `FastAPI Boilerplate`           | Tên app (hiện trên /docs)                |
-| `DEBUG`                     | `false`                         | Chồng traceback khi có lỗi               |
+| `DEBUG`                     | `false`                         | Traceback khi lỗi + cho phép SECRET_KEY yếu (chỉ dev) |
 | `LOG_LEVEL`                 | `INFO`                          | Level log                                 |
-| `API_V1_PREFIX`             | `/v1`                           | Prefix API v1                             |
 | `DATABASE_URL`              | `sqlite+aiosqlite:///./app.db`  | URL SQLAlchemy (async)                   |
 | `AUTO_CREATE_TABLES`        | `false`                         | Tự `create_all` khi start (dev only)     |
-| `SECRET_KEY`                | —                               | **Bắt buộc đổi** (JWT signing key)       |
+| `SECRET_KEY`                | —                               | **Bắt buộc**, ≥ 32 ký tự (`openssl rand -hex 32`) khi `DEBUG=false` |
 | `REDIS_URL`                 | `` (trống = tắt rate limit)     | Ví dụ `redis://localhost:6379/0`         |
 | `RATE_LIMIT_ENABLED`        | `true`                          | `false` để tắt hoàn toàn                 |
 | `RATE_LIMIT_GLOBAL`         | `100`                           | Request/IP/window cho mọi endpoint v1    |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60`                            | Cửa sổ tính limit (giây)                 |
+| `RATE_LIMIT_AUTH_PER_MINUTE`| `10`                            | Request/IP/phút cho register + login     |
+| `FORWARDED_ALLOW_IPS`       | `127.0.0.1`                     | (uvicorn) IP/CIDR proxy được tin để lấy IP thật |
 | `JWT_ALGORITHM`             | `HS256`                         | Algorithm JWT                             |
 | `ACCESS_TOKEN_EXPIRE_MINUTES`| `1440`                          | Thời hạn token (phút)                    |
-| `CORS_ORIGINS`              | `["*"]`                         | List origins được phép                   |
+| `CORS_ORIGINS`              | `["*"]`                         | JSON list origins, vd `["https://app.example.com"]` |
 | `DEFAULT_PAGE_SIZE`         | `20`                            | `limit` mặc định của list                |
 | `MAX_PAGE_SIZE`             | `100`                           | `limit` tối đa                           |
 

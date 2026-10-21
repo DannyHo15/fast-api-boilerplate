@@ -17,9 +17,22 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install ".[postgres]"
 
+# Migrations run inside the container (`alembic upgrade head`, see docker-compose.yml)
+COPY alembic.ini ./
+COPY alembic ./alembic
+
+# Non-root user; /app/data is the only writable dir (default SQLite location).
+RUN useradd --create-home --uid 1000 app \
+    && mkdir /app/data && chown app /app/data
+USER app
+ENV DATABASE_URL=sqlite+aiosqlite:////app/data/app.db
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
-ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# CMD (not ENTRYPOINT) so `docker run <image> <command>` / compose `command:` replace it.
+# Behind a reverse proxy, set FORWARDED_ALLOW_IPS to the proxy's IP/CIDR so the
+# real client IP (X-Forwarded-For) is used for rate limiting.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

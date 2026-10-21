@@ -17,6 +17,21 @@ def test_bcrypt_roundtrip() -> None:
     assert hasher.verify("wrongpassword", hashed) is False
 
 
+def test_bcrypt_accepts_72_byte_password() -> None:
+    """72 UTF-8 bytes is the domain maximum; it must hash and verify."""
+    hasher = BcryptPasswordHasher()
+    password = "ặ" * 24  # 24 x 3 bytes = 72 bytes
+    assert hasher.verify(password, hasher.hash(password)) is True
+
+
+def test_bcrypt_verifies_legacy_hash_of_long_password() -> None:
+    """bcrypt<5 hashed only the first 72 bytes of longer passwords."""
+    hasher = BcryptPasswordHasher()
+    legacy_hash = hasher.hash("x" * 72)
+    assert hasher.verify("x" * 100, legacy_hash) is True
+    assert hasher.verify("y" * 100, legacy_hash) is False
+
+
 def test_bcrypt_rejects_malformed_hash() -> None:
     hasher = BcryptPasswordHasher()
     assert hasher.verify("anything", "not-a-valid-hash") is False

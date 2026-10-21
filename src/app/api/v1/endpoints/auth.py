@@ -16,11 +16,12 @@ from app.domain.entities.user import User
 
 router = APIRouter()
 
-# Stricter budget for auth endpoints (per IP per minute) to slow down
-# brute-force / credential-stuffing attempts. Stacked on top of the global
-# limit, keyed in its own "auth" scope.
-AUTH_LIMIT_PER_MINUTE = 10
-auth_rate_limit = [Depends(rate_limit("auth", limit=AUTH_LIMIT_PER_MINUTE, window_seconds=60))]
+# Stricter budget for auth endpoints (RATE_LIMIT_AUTH_PER_MINUTE per IP) to
+# slow down brute-force / credential-stuffing attempts. Stacked on top of the
+# global limit, keyed in its own "auth" scope.
+auth_rate_limit = [
+    Depends(rate_limit("auth", limit=lambda s: s.rate_limit_auth_per_minute, window_seconds=60))
+]
 
 
 @router.post(

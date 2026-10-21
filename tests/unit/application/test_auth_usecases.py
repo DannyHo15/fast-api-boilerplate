@@ -38,7 +38,8 @@ async def test_register_rejects_duplicate_email() -> None:
         await usecase.execute(RegisterUserInput(email="ALICE@example.com", password="othersecret1"))
 
 
-@pytest.mark.parametrize("password", ["short", "x" * 129])
+# 73 ASCII bytes, and 25 x 3-byte chars = 75 bytes: both over bcrypt's 72-byte limit.
+@pytest.mark.parametrize("password", ["short", "x" * 73, "ặ" * 25])
 async def test_register_rejects_invalid_password(password: str) -> None:
     usecase = RegisterUserUseCase(InMemoryUserRepository(), FakePasswordHasher())
     with pytest.raises(DomainError):
@@ -74,3 +75,20 @@ async def test_authenticate_failure(email: str, password: str) -> None:
 
     with pytest.raises(InvalidCredentialsError):
         await usecase.execute(AuthenticateUserInput(email=email, password=password))
+
+
+async def test_authenticate_unknown_email_still_spends_a_hash() -> None:
+    """Unknown email costs one bcrypt round too, so timing does not reveal it."""
+
+    class CountingHasher(FakePasswordHasher):
+        calls = 0
+
+        def hash(self, password: str) -> str:
+            self.calls += 1
+            return super().hash(password)
+
+    hasher = CountingHasher()
+    usecase = AuthenticateUserUseCase(InMemoryUserRepository(), hasher)
+    with pytest.raises(InvalidCredentialsError):
+        await usecase.execute(AuthenticateUserInput(email="ghost@example.com", password="x" * 8))
+    assert hasher.calls == 1

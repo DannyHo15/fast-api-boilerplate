@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
-from app.api.deps import CurrentUser, TaskRepositoryDep
+from app.api.deps import CurrentUser, PageParamsDep, TaskRepositoryDep
 from app.api.schemas.common import Page, PageMeta
 from app.api.schemas.task import TaskCreate, TaskRead, TaskUpdate
 from app.application.tasks.create_task import CreateTaskInput, CreateTaskUseCase
@@ -13,12 +13,9 @@ from app.application.tasks.delete_task import DeleteTaskUseCase
 from app.application.tasks.get_task import GetTaskUseCase
 from app.application.tasks.list_tasks import ListTasksInput, ListTasksUseCase
 from app.application.tasks.update_task import TaskChanges, UpdateTaskUseCase
-from app.core.config import get_settings
 from app.domain.entities.task import Task, TaskStatus
 
 router = APIRouter()
-
-_settings = get_settings()
 
 
 def _build_changes(payload: TaskUpdate) -> TaskChanges:
@@ -66,19 +63,18 @@ async def create_task(
 async def list_tasks(
     tasks: TaskRepositoryDep,
     user: CurrentUser,
+    paging: PageParamsDep,
     status_filter: Annotated[
         TaskStatus | None,
         Query(alias="status", description="Filter by task status"),
     ] = None,
-    offset: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=_settings.max_page_size)] = _settings.default_page_size,
 ) -> Page[TaskRead]:
     page = await ListTasksUseCase(tasks).execute(
         ListTasksInput(
             owner_id=user.id,
             status=status_filter,
-            offset=offset,
-            limit=limit,
+            offset=paging.offset,
+            limit=paging.limit,
         )
     )
     return Page[TaskRead](

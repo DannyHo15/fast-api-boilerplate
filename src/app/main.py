@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 from app.api.errors import register_exception_handlers
+from app.api.v1 import API_V1_PREFIX
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.logging import setup_logging
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create/destroy application resources around the app's lifetime."""
     settings: Settings = app.state.settings
+    # Checked here, not at import, so tests / alembic / tooling still import the app.
+    settings.check_secret_key()
     database = create_database(settings.database_url)
     if settings.auto_create_tables:
         async with database.engine.begin() as conn:
@@ -55,7 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=settings.app_version,
         debug=settings.debug,
         lifespan=lifespan,
-        openapi_url=f"{settings.api_v1_prefix}/openapi.json",
+        openapi_url=f"{API_V1_PREFIX}/openapi.json",
         docs_url="/docs",
         redoc_url=None,
     )
@@ -89,7 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def liveness() -> dict[str, str]:
         return {"status": "ok"}
 
-    app.include_router(api_router, prefix=settings.api_v1_prefix)
+    app.include_router(api_router, prefix=API_V1_PREFIX)
     return app
 
 
