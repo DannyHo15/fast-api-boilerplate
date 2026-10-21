@@ -1,0 +1,1 @@
+"""Application package (Clean Architecture)."""
