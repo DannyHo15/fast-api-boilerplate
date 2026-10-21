@@ -7,12 +7,15 @@ Usage:
     print(settings.database_url)
 """
 
+import logging
 from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 MIN_SECRET_KEY_LENGTH = 32
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -70,11 +73,14 @@ class Settings(BaseSettings):
 
     def check_secret_key(self) -> None:
         """Refuse a weak JWT signing key outside debug mode."""
-        if not self.debug and len(self.secret_key) < MIN_SECRET_KEY_LENGTH:
+        if len(self.secret_key) >= MIN_SECRET_KEY_LENGTH:
+            return
+        if not self.debug:
             raise RuntimeError(
                 f"SECRET_KEY must be at least {MIN_SECRET_KEY_LENGTH} characters "
-                "(generate one with `openssl rand -hex 32`), or set DEBUG=true for local dev."
+                "(run `make env`, or `openssl rand -hex 32`), or set DEBUG=true for local dev."
             )
+        logger.warning("Weak SECRET_KEY accepted because DEBUG=true - never deploy like this")
 
 
 @lru_cache

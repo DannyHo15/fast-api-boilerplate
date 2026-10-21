@@ -43,6 +43,7 @@ After generating, run:
 from __future__ import annotations
 
 import ast
+import keyword
 import re
 import string
 import subprocess
@@ -69,11 +70,16 @@ def pluralize(snake: str) -> str:
 
 
 def validate_name(name: str) -> None:
-    if not re.fullmatch(r"[a-z][a-z0-9]*(_[a-z0-9]+)*", name or ""):
+    if not re.fullmatch(r"[a-z][a-z0-9]*(_[a-z0-9]+)*", name or "") or keyword.iskeyword(name):
         sys.exit(
             f"error: invalid resource name {name!r} - use lowercase snake_case "
             "(e.g. 'note', 'user_profile')"
         )
+    # The endpoint module is imported into router.py by this name: it must not
+    # shadow anything already there (e.g. `rate_limited`, `api_router`).
+    router_text = (ROOT / "src/app/api/v1/router.py").read_text(encoding="utf-8")
+    if re.search(rf"\b{name}\b", router_text):
+        sys.exit(f"error: {name!r} is already used in src/app/api/v1/router.py - pick another name")
 
 
 # ---------------------------------------------------------------------------

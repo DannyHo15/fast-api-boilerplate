@@ -79,8 +79,9 @@ src/app/
 # 1. Tạo venv + cài đặt
 make install            # hoặc: python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
-# 2. Tạo file env (mặc định dùng SQLite tại ./app.db, auto-create tables, DEBUG=true)
-cp .env.example .env
+# 2. Tạo file .env từ .env.example + tự sinh SECRET_KEY ngẫu nhiên
+#    (mặc định dùng SQLite tại ./app.db, auto-create tables)
+make env
 
 # 3. Chạy server (dev, có reload)
 make run                # hoặc: .venv/bin/uvicorn app.main:app --reload
@@ -192,7 +193,7 @@ make revision m="add notes column"          # autogenerate migration mới sau k
 ## Docker (PostgreSQL)
 
 ```bash
-echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # bắt buộc, compose đọc từ .env
+make env              # nếu chưa có .env: sinh SECRET_KEY (compose đọc từ .env)
 make docker-up        # build + chạy migration + api (8000) + postgres (5432) + redis
 make docker-down
 ```

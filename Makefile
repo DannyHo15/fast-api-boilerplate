@@ -1,4 +1,4 @@
-.PHONY: install run test lint format typecheck migrate revision revision-check docker-up docker-down clean
+.PHONY: install env run test lint format typecheck migrate revision revision-check docker-up docker-down clean
 
 VENV := .venv
 PIP := $(VENV)/bin/pip
@@ -11,6 +11,11 @@ venv:
 
 install: venv
 	$(PIP) install -e ".[dev]"
+
+env:
+	@test ! -f .env || { echo ".env already exists - not overwriting"; exit 1; }
+	cp .env.example .env
+	sed -i.bak "s/^SECRET_KEY=.*/SECRET_KEY=$$(openssl rand -hex 32)/" .env && rm .env.bak
 
 run:
 	$(VENV)/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

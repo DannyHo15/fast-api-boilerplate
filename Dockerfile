@@ -21,8 +21,11 @@ RUN pip install ".[postgres]"
 COPY alembic.ini ./
 COPY alembic ./alembic
 
-RUN useradd --create-home --uid 1000 app
+# Non-root user; /app/data is the only writable dir (default SQLite location).
+RUN useradd --create-home --uid 1000 app \
+    && mkdir /app/data && chown app /app/data
 USER app
+ENV DATABASE_URL=sqlite+aiosqlite:////app/data/app.db
 
 EXPOSE 8000
 

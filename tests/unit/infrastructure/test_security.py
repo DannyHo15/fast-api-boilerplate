@@ -24,6 +24,14 @@ def test_bcrypt_accepts_72_byte_password() -> None:
     assert hasher.verify(password, hasher.hash(password)) is True
 
 
+def test_bcrypt_verifies_legacy_hash_of_long_password() -> None:
+    """bcrypt<5 hashed only the first 72 bytes of longer passwords."""
+    hasher = BcryptPasswordHasher()
+    legacy_hash = hasher.hash("x" * 72)
+    assert hasher.verify("x" * 100, legacy_hash) is True
+    assert hasher.verify("y" * 100, legacy_hash) is False
+
+
 def test_bcrypt_rejects_malformed_hash() -> None:
     hasher = BcryptPasswordHasher()
     assert hasher.verify("anything", "not-a-valid-hash") is False

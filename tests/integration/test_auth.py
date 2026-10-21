@@ -101,8 +101,8 @@ async def test_register_password_over_72_bytes_is_rejected_not_500(client) -> No
     response = await client.post(
         "/v1/auth/register", json={"email": "viet@example.com", "password": "ặ" * 30}
     )
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "DOMAIN_ERROR"
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
 
     response = await client.post(
         "/v1/auth/register", json={"email": "long@example.com", "password": "x" * 80}
